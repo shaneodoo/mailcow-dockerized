@@ -611,10 +611,10 @@ rspamd_config:register_symbol({
             -- add footer
             local out = {}
             local rewrite = lua_mime.add_text_footer(task, footer.html, footer.plain) or {}
-        
+
             local seen_cte
             local newline_s = newline(task)
-        
+
             local function rewrite_ct_cb(name, hdr)
               if rewrite.need_rewrite_ct then
                 if name:lower() == 'content-type' then
