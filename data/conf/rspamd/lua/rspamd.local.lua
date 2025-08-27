@@ -611,22 +611,26 @@ rspamd_config:register_symbol({
             -- add footer
             local out = {}
             local rewrite = lua_mime.add_text_footer(task, footer.html, footer.plain) or {}
-        
+            
             local seen_cte
             local newline_s = newline(task)
-        
+            
             local function rewrite_ct_cb(name, hdr)
               if rewrite.need_rewrite_ct then
                 if name:lower() == 'content-type' then
-                  local nct = string.format('%s: %s/%s; charset=utf-8',
-                      'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype)
+                  -- NEW: include boundary if present
+                  local boundary_part = rewrite.new_ct.boundary and
+                    string.format('; boundary="%s"', rewrite.new_ct.boundary) or ''
+                  local nct = string.format('%s: %s/%s; charset=utf-8%s',
+                      'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)
                   out[#out + 1] = nct
-                  -- update Content-Type header
+                  -- update Content-Type header (include boundary if present)
                   task:set_milter_reply({
                     remove_headers = {['Content-Type'] = 0},
                   })
                   task:set_milter_reply({
-                    add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8', rewrite.new_ct.type, rewrite.new_ct.subtype)}
+                    add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8%s',
+                      rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)}
                   })
                   return
                 elseif name:lower() == 'content-transfer-encoding' then
