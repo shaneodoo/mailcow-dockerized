@@ -608,28 +608,32 @@ rspamd_config:register_symbol({
               footer.plain = lua_util.jinja_template(footer.plain, replacements, true)
             end
   
-            -- add footer
+           -- add footer
             local out = {}
             local rewrite = lua_mime.add_text_footer(task, footer.html, footer.plain) or {}
-        
+            
             local seen_cte
             local newline_s = newline(task)
-        
+            
             local function rewrite_ct_cb(name, hdr)
               if rewrite.need_rewrite_ct then
-                if name:lower() == 'content-type' then
-                  local nct = string.format('%s: %s/%s; charset=utf-8',
-                      'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype)
+                if name:lower() == 'content-type' and not hdr.value:lower():match('^multipart/') then
+                  -- NEW: include boundary if present
+                  local boundary_part = rewrite.new_ct.boundary and
+                    string.format('; boundary="%s"', rewrite.new_ct.boundary) or ''
+                  local nct = string.format('%s: %s/%s; charset=utf-8%s',
+                      'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)
                   out[#out + 1] = nct
-                  -- update Content-Type header
+                  -- update Content-Type header (include boundary if present)
                   task:set_milter_reply({
                     remove_headers = {['Content-Type'] = 0},
                   })
                   task:set_milter_reply({
-                    add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8', rewrite.new_ct.type, rewrite.new_ct.subtype)}
+                    add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8%s',
+                      rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)}
                   })
                   return
-                elseif name:lower() == 'content-transfer-encoding' then
+                  elseif name:lower() == 'content-transfer-encoding' and not hdr.value:lower():match('^multipart/') then
                   out[#out + 1] = string.format('%s: %s',
                       'Content-Transfer-Encoding', 'quoted-printable')
                   -- update Content-Transfer-Encoding header
@@ -645,6 +649,8 @@ rspamd_config:register_symbol({
               end
               out[#out + 1] = hdr.raw:gsub('\r?\n?$', '')
             end
+
+
         
             task:headers_foreach(rewrite_ct_cb, {full = true})
         
