@@ -102,7 +102,7 @@ rspamd_config:register_symbol({
       local rcpt_split = rspamd_str_split(rcpt['addr'], '@')
       if #rcpt_split == 2 then
         if rcpt_split[1] == 'postmaster' then
-          task:set_pre_result('accept', 'whitelisting postmaster smtp rcpt')
+          task:set_pre_result('accept', 'whitelisting postmaster smtp rcpt', 'postmaster')
           return
         end
       end
@@ -167,7 +167,7 @@ rspamd_config:register_symbol({
         for k,v in pairs(data) do
           if (v and v ~= userdata and v == '1') then
             rspamd_logger.infox(rspamd_config, "found ip in keep_spam map, setting pre-result")
-            task:set_pre_result('accept', 'ip matched with forward hosts')
+            task:set_pre_result('accept', 'ip matched with forward hosts', 'keep_spam')
           end
         end
       end
@@ -454,11 +454,17 @@ rspamd_config:register_symbol({
     local redis_params = rspamd_parse_redis_server('dyn_rl')
     local rspamd_logger = require "rspamd_logger"
     local envfrom = task:get_from(1)
+    local envrcpt = task:get_recipients(1) or {}
     local uname = task:get_user()
     if not envfrom or not uname then
       return false
     end
+
     local uname = uname:lower()
+
+    if #envrcpt == 1 and envrcpt[1].addr:lower() == uname then
+      return false
+    end
 
     local env_from_domain = envfrom[1].domain:lower() -- get smtp from domain in lower case
 
@@ -544,150 +550,170 @@ rspamd_config:register_symbol({
     -- determine newline type
     local function newline(task)
       local t = task:get_newlines_type()
-    
+
       if t == 'cr' then
         return '\r'
       elseif t == 'lf' then
         return '\n'
       end
-    
+
       return '\r\n'
     end
+    
     -- retrieve footer
     local function footer_cb(err_message, code, data, headers)
-      if err or type(data) ~= 'string' then
-        rspamd_logger.infox(rspamd_config, "domain wide footer request for user %s returned invalid or empty data (\"%s\") or error (\"%s\")", uname, data, err)
-      else
-        
-        -- parse json string
-        local footer = cjson.decode(data)
-        if not footer then
-          rspamd_logger.infox(rspamd_config, "parsing domain wide footer for user %s returned invalid or empty data (\"%s\") or error (\"%s\")", uname, data, err)
-        else
-          if footer and type(footer) == "table" and (footer.html and footer.html ~= "" or footer.plain and footer.plain ~= "")  then
-            rspamd_logger.infox(rspamd_config, "found domain wide footer for user %s: html=%s, plain=%s, vars=%s", uname, footer.html, footer.plain, footer.vars)
+      -- CHANGE 1: Fixed error variable name from 'err' to 'err_message' and added early return
+      if err_message or type(data) ~= 'string' then
+        rspamd_logger.infox(rspamd_config, "domain wide footer request for user %s returned invalid or empty data (\"%s\") or error (\"%s\")", uname, data, err_message)
+        return
+      end
 
-            if footer.skip_replies ~= 0 then
-              in_reply_to = task:get_header_raw('in-reply-to')
-              if in_reply_to then
-                rspamd_logger.infox(rspamd_config, "mail is a reply - skip footer")
-                return
-              end
-            end
+      -- parse json string
+      local footer = cjson.decode(data)
+      -- CHANGE 2: Restructured validation with early returns instead of nested if/else
+      if not footer then
+        rspamd_logger.infox(rspamd_config, "parsing domain wide footer for user %s returned invalid or empty data (\"%s\")", uname, data)
+        return
+      end
+      
+      if not (footer and type(footer) == "table" and (footer.html and footer.html ~= "" or footer.plain and footer.plain ~= "")) then
+        rspamd_logger.infox(rspamd_config, "domain wide footer request for user %s returned invalid or empty data (\"%s\")", uname, data)
+        return
+      end
 
-            local envfrom_mime = task:get_from(2)
-            local from_name = ""
-            if envfrom_mime and envfrom_mime[1].name then
-              from_name = envfrom_mime[1].name
-            elseif envfrom and envfrom[1].name then
-              from_name = envfrom[1].name
-            end
+      rspamd_logger.infox(rspamd_config, "found domain wide footer for user %s: html=%s, plain=%s, vars=%s", uname, footer.html, footer.plain, footer.vars)
 
-            -- default replacements
-            local replacements = {
-              auth_user = uname,
-              from_user = envfrom[1].user,
-              from_name = from_name,
-              from_addr = envfrom[1].addr,
-              from_domain = envfrom[1].domain:lower()
-            }
-            -- add custom mailbox attributes
-            if footer.vars and type(footer.vars) == "string" then
-              local footer_vars = cjson.decode(footer.vars)
+      -- Check if mail is a reply and skip if needed
+      if footer.skip_replies ~= 0 then
+        local in_reply_to = task:get_header_raw('in-reply-to')
+        if in_reply_to then
+          rspamd_logger.infox(rspamd_config, "mail is a reply - skip footer")
+          return
+        end
+      end
 
-              if type(footer_vars) == "table" then
-                for key, value in pairs(footer_vars) do
-                  replacements[key] = value
-                end
-              end
-            end
-            if footer.html and footer.html ~= "" then
-              footer.html = lua_util.jinja_template(footer.html, replacements, true)
-            end
-            if footer.plain and footer.plain ~= "" then
-              footer.plain = lua_util.jinja_template(footer.plain, replacements, true)
-            end
-  
-            -- add footer
-            local out = {}
-            local rewrite = lua_mime.add_text_footer(task, footer.html, footer.plain) or {}
-            
-            local seen_cte
-            local newline_s = newline(task)
-            
-            local function rewrite_ct_cb(name, hdr)
-              if rewrite.need_rewrite_ct then
-                if name:lower() == 'content-type' and not hdr.value:lower():match('^multipart/') then
-                  -- NEW: include boundary if present
-                  local boundary_part = rewrite.new_ct.boundary and
-                    string.format('; boundary="%s"', rewrite.new_ct.boundary) or ''
-                  local nct = string.format('%s: %s/%s; charset=utf-8%s',
-                      'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)
-                  out[#out + 1] = nct
-                  -- update Content-Type header (include boundary if present)
-                  task:set_milter_reply({
-                    remove_headers = {['Content-Type'] = 0},
-                  })
-                  task:set_milter_reply({
-                    add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8%s',
-                      rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)}
-                  })
-                  return
-                  elseif name:lower() == 'content-transfer-encoding' and not hdr.value:lower():match('^multipart/') then
-                  out[#out + 1] = string.format('%s: %s',
-                      'Content-Transfer-Encoding', 'quoted-printable')
-                  -- update Content-Transfer-Encoding header
-                  task:set_milter_reply({
-                    remove_headers = {['Content-Transfer-Encoding'] = 0},
-                  })
-                  task:set_milter_reply({
-                    add_headers = {['Content-Transfer-Encoding'] = 'quoted-printable'}
-                  })
-                  seen_cte = true
-                  return
-                end
-              end
-              out[#out + 1] = hdr.raw:gsub('\r?\n?$', '')
-            end
+      -- CHANGE 3: NEW SAFETY CHECK - Skip multipart/mixed messages (likely have attachments)
+      local ct = task:get_header('Content-Type')
+      if ct and ct:lower():match('multipart/mixed') then
+        rspamd_logger.infox(rspamd_config, "skipping footer for multipart/mixed message (has attachments)")
+        return
+      end
 
-            task:headers_foreach(rewrite_ct_cb, {full = true})
-        
-            if not seen_cte and rewrite.need_rewrite_ct then
-              out[#out + 1] = string.format('%s: %s', 'Content-Transfer-Encoding', 'quoted-printable')
-            end
-        
-            -- End of headers
-            out[#out + 1] = newline_s
-        
-            if rewrite.out then
-              for _,o in ipairs(rewrite.out) do
-                out[#out + 1] = o
-              end
-            else
-              out[#out + 1] = task:get_rawbody()
-            end
-            local out_parts = {}
-            for _,o in ipairs(out) do
-              if type(o) ~= 'table' then
-                out_parts[#out_parts + 1] = o
-                out_parts[#out_parts + 1] = newline_s
-              else
-                local removePrefix = "--\x0D\x0AContent-Type"
-                if string.lower(string.sub(tostring(o[1]), 1, string.len(removePrefix))) == string.lower(removePrefix) then
-                  o[1] = string.sub(tostring(o[1]), string.len("--\x0D\x0A") + 1)
-                end
-                out_parts[#out_parts + 1] = o[1]
-                if o[2] then
-                  out_parts[#out_parts + 1] = newline_s
-                end
-              end
-            end
-            task:set_message(out_parts)
-          else
-            rspamd_logger.infox(rspamd_config, "domain wide footer request for user %s returned invalid or empty data (\"%s\")", uname, data)
+      local envfrom_mime = task:get_from(2)
+      local from_name = ""
+      if envfrom_mime and envfrom_mime[1].name then
+        from_name = envfrom_mime[1].name
+      elseif envfrom and envfrom[1].name then
+        from_name = envfrom[1].name
+      end
+
+      -- default replacements
+      local replacements = {
+        auth_user = uname,
+        from_user = envfrom[1].user,
+        from_name = from_name,
+        from_addr = envfrom[1].addr,
+        from_domain = envfrom[1].domain:lower()
+      }
+      
+      -- add custom mailbox attributes
+      if footer.vars and type(footer.vars) == "string" then
+        local footer_vars = cjson.decode(footer.vars)
+
+        if type(footer_vars) == "table" then
+          for key, value in pairs(footer_vars) do
+            replacements[key] = value
           end
         end
       end
+      
+      if footer.html and footer.html ~= "" then
+        footer.html = lua_util.jinja_template(footer.html, replacements, true)
+      end
+      if footer.plain and footer.plain ~= "" then
+        footer.plain = lua_util.jinja_template(footer.plain, replacements, true)
+      end
+
+      -- add footer
+      local out = {}
+      local rewrite = lua_mime.add_text_footer(task, footer.html, footer.plain) or {}
+
+      local seen_cte
+      local newline_s = newline(task)
+
+      local function rewrite_ct_cb(name, hdr)
+        if rewrite.need_rewrite_ct then
+          if name:lower() == 'content-type' then
+            -- include boundary if present
+            local boundary_part = rewrite.new_ct.boundary and
+              string.format('; boundary="%s"', rewrite.new_ct.boundary) or ''
+            local nct = string.format('%s: %s/%s; charset=utf-8%s',
+                'Content-Type', rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)
+            out[#out + 1] = nct
+            -- update Content-Type header (include boundary if present)
+            task:set_milter_reply({
+              remove_headers = {['Content-Type'] = 0},
+            })
+            task:set_milter_reply({
+              add_headers = {['Content-Type'] = string.format('%s/%s; charset=utf-8%s',
+                rewrite.new_ct.type, rewrite.new_ct.subtype, boundary_part)}
+            })
+            return
+          elseif name:lower() == 'content-transfer-encoding' then
+            -- CHANGE 4: Only change encoding for text parts, preserve base64 for attachments
+            if rewrite.new_ct and rewrite.new_ct.type == 'text' then
+              out[#out + 1] = string.format('%s: %s',
+                  'Content-Transfer-Encoding', 'quoted-printable')
+              task:set_milter_reply({
+                remove_headers = {['Content-Transfer-Encoding'] = 0},
+              })
+              task:set_milter_reply({
+                add_headers = {['Content-Transfer-Encoding'] = 'quoted-printable'}
+              })
+              seen_cte = true
+            else
+              -- Preserve original encoding for non-text parts
+              out[#out + 1] = hdr.raw:gsub('\r?\n?$', '')
+            end
+            return
+          end
+        end
+        out[#out + 1] = hdr.raw:gsub('\r?\n?$', '')
+      end
+
+      task:headers_foreach(rewrite_ct_cb, {full = true})
+
+      if not seen_cte and rewrite.need_rewrite_ct then
+        out[#out + 1] = string.format('%s: %s', 'Content-Transfer-Encoding', 'quoted-printable')
+      end
+
+      -- End of headers
+      out[#out + 1] = newline_s
+
+      if rewrite.out then
+        for _,o in ipairs(rewrite.out) do
+          out[#out + 1] = o
+        end
+      else
+        out[#out + 1] = task:get_rawbody()
+      end
+      
+      local out_parts = {}
+      for _,o in ipairs(out) do
+        if type(o) ~= 'table' then
+          out_parts[#out_parts + 1] = o
+          out_parts[#out_parts + 1] = newline_s
+        else
+          -- CHANGE 5: REMOVED boundary stripping code that was destroying MIME structure
+          -- Just add the part as-is without modification
+          out_parts[#out_parts + 1] = o[1]
+          if o[2] then
+            out_parts[#out_parts + 1] = newline_s
+          end
+        end
+      end
+      
+      task:set_message(out_parts)
     end
 
     -- fetch footer
