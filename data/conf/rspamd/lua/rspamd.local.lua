@@ -592,10 +592,17 @@ rspamd_config:register_symbol({
         end
       end
 
-      -- CHANGE 3: NEW SAFETY CHECK - Skip multipart/mixed messages (likely have attachments)
+      -- CHANGE 3: NEW SAFETY CHECK - Skip messages with attachments
+      -- Check for HAS_ATTACHMENT symbol (more reliable than Content-Type parsing)
+      if task:has_symbol('HAS_ATTACHMENT') then
+        rspamd_logger.infox(rspamd_config, "skipping footer for message with attachments (HAS_ATTACHMENT symbol present)")
+        return
+      end
+      
+      -- Fallback: also check Content-Type header for multipart/mixed
       local ct = task:get_header('Content-Type')
       if ct and ct:lower():match('multipart/mixed') then
-        rspamd_logger.infox(rspamd_config, "skipping footer for multipart/mixed message (has attachments)")
+        rspamd_logger.infox(rspamd_config, "skipping footer for multipart/mixed message")
         return
       end
 
